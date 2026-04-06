@@ -1,0 +1,818 @@
+// Package services - PDF 周报/月报自动生成（增强版 v2）
+// 基于 gofpdf 渲染经营摘要 PDF，包含：
+//   1. 核心 KPI 卡片表
+//   2. 本期 vs 上期环比对比表
+//   3. 销售趋势迷你折线图（gofpdf 原生矢量绘制）
+//   4. 利润结构百分比条形图
+//   5. Top 5 ASIN 利润排行表
+//   6. 广告 ROI 摘要
+package services
+
+import (
+	"fmt"
+	"log/slog"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"time"
+
+	"github.com/jung-kurt/gofpdf"
+	"voyage/internal/database"
+)
+
+// ReportType 报表类型
+type ReportType string
+
+const (
+	ReportWeekly  ReportType = "weekly"
+	ReportMonthly ReportType = "monthly"
+)
+
+
+
+// ReportResult PDF 生成结果
+type ReportResult struct {
+	Success  bool   `json:"success"`
+	Path     string `json:"path"`
+	Message  string `json:"message"`
+	FileSize string `json:"fileSize"`
+}
+
+// ── 内部数据结构 ──────────────────────────────────────────
+
+// pdfDailyPoint 每日数据点（用于趋势图绘制）
+type pdfDailyPoint struct {
+	Date  string
+	Sales float64
+}
+
+// pdfAsinRank ASIN 排行条目（PDF 用）
+type pdfAsinRank struct {
+	ASIN    string
+	Title   string
+	Sales   float64
+	Profit  float64
+	Margin  float64
+	Units   int
+}
+
+// GenerateReport 生成 PDF 经营报告（增强版）
+func GenerateReport(db *database.DB, accountID int64, marketplaceID, dataDir string, rType ReportType) ReportResult {
+	slog.Info("开始生成 PDF 报告", "account", accountID, "marketplace", marketplaceID, "type", rType, "dataDir", dataDir)
+
+	now := time.Now()
+	var dateStart, dateEnd, title, fileName string
+	var prevStart, prevEnd string
+
+	if rType == ReportWeekly {
+		// 上一完整周（周一 ~ 周日）
+		weekday := int(now.Weekday())
+		if weekday == 0 { weekday = 7 }
+		end := now.AddDate(0, 0, -weekday)
+		start := end.AddDate(0, 0, -6)
+		dateStart = start.Format("2006-01-02")
+		dateEnd = end.Format("2006-01-02")
+		title = fmt.Sprintf("Voyage Weekly Report  %s ~ %s", dateStart, dateEnd)
+		fileName = fmt.Sprintf("voyage_weekly_%s.pdf", end.Format("20060102"))
+		// 上期 = 再上一周
+		prevEnd = start.AddDate(0, 0, -1).Format("2006-01-02")
+		prevStart = start.AddDate(0, 0, -7).Format("2006-01-02")
+	} else {
+		// 上一完整月
+		firstOfMonth := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.Local)
+		end := firstOfMonth.AddDate(0, 0, -1)
+		start := time.Date(end.Year(), end.Month(), 1, 0, 0, 0, 0, time.Local)
+		dateStart = start.Format("2006-01-02")
+		dateEnd = end.Format("2006-01-02")
+		title = fmt.Sprintf("Voyage Monthly Report  %d-%02d", end.Year(), int(end.Month()))
+		fileName = fmt.Sprintf("voyage_monthly_%s.pdf", end.Format("200601"))
+		// 上期 = 再上一个月
+		prevEnd = start.AddDate(0, 0, -1).Format("2006-01-02")
+		prevMonth := time.Date(start.Year(), start.Month()-1, 1, 0, 0, 0, 0, time.Local)
+		prevStart = prevMonth.Format("2006-01-02")
+	}
+	slog.Info("PDF 报告日期范围", "start", dateStart, "end", dateEnd, "prevStart", prevStart, "prevEnd", prevEnd)
+
+	// ── 查询当期 KPI ────────────────────────────────────
+	curr := queryPeriodKPI(db, accountID, marketplaceID, dateStart, dateEnd)
+	// ── 查询上期 KPI ────────────────────────────────────
+	prev := queryPeriodKPI(db, accountID, marketplaceID, prevStart, prevEnd)
+
+	// 查询货币
+	currency := "USD"
+	db.QueryRow("SELECT currency_code FROM marketplace WHERE marketplace_id=?", marketplaceID).Scan(&currency)
+
+	// ── 查询每日销售趋势 ────────────────────────────────
+	dailyPoints := queryDailySales(db, accountID, marketplaceID, dateStart, dateEnd)
+
+	// ── 查询 Top 5 ASIN 排行 ────────────────────────────
+	top5 := queryTopAsins(db, accountID, marketplaceID, dateStart, dateEnd, 5)
+
+	// ── 查询广告 ROI 摘要 ────────────────────────────────
+	var adImpressions, adClicks, adOrders int
+	var adSales float64
+	db.QueryRow(`SELECT COALESCE(SUM(impressions),0), COALESCE(SUM(clicks),0),
+		COALESCE(SUM(attributed_conversions_7d),0), COALESCE(SUM(attributed_sales_7d),0)
+		FROM ad_performance_daily apd
+		JOIN ad_campaigns ac ON apd.campaign_id=ac.campaign_id AND apd.account_id=ac.account_id
+		WHERE apd.account_id=? AND ac.marketplace_id=? AND apd.date>=? AND apd.date<=?`,
+		accountID, marketplaceID, dateStart, dateEnd).Scan(&adImpressions, &adClicks, &adOrders, &adSales)
+
+	adCTR := 0.0
+	if adImpressions > 0 { adCTR = float64(adClicks) / float64(adImpressions) * 100 }
+	adCPC := 0.0
+	if adClicks > 0 { adCPC = curr.adSpend / float64(adClicks) }
+	adROAS := 0.0
+	if curr.adSpend > 0 { adROAS = adSales / curr.adSpend }
+
+	// ── 生成 PDF ────────────────────────────────────────
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		slog.Error("PDF: 创建报告目录失败", "dir", dataDir, "error", err)
+		return ReportResult{Success: false, Message: fmt.Sprintf("创建报告目录失败: %v", err)}
+	}
+	outPath := filepath.Join(dataDir, fileName)
+	slog.Info("PDF 输出路径", "path", outPath)
+
+	pdf := gofpdf.New("P", "mm", "A4", "")
+	pdf.SetMargins(15, 15, 15)
+	pdf.AddPage()
+
+	// ────── 第一页：标题 + KPI + 环比 + 趋势图 ──────
+
+	// 标题
+	pdf.SetFont("Helvetica", "B", 18)
+	pdf.SetTextColor(26, 39, 68)
+	pdf.CellFormat(180, 14, title, "", 1, "C", false, 0, "")
+	pdf.Ln(3)
+
+	// 副标题
+	pdf.SetFont("Helvetica", "", 9)
+	pdf.SetTextColor(120, 120, 120)
+	pdf.CellFormat(180, 5, fmt.Sprintf("Generated by Voyage Analytics Platform · %s · Account #%d",
+		now.Format("2006-01-02 15:04"), accountID), "", 1, "C", false, 0, "")
+	pdf.Ln(5)
+
+	// 金色分隔线
+	drawDivider(pdf)
+
+	// ── Section 1: 核心 KPI 表 ──
+	drawSectionTitle(pdf, "1. Core KPIs")
+
+	kpis := []struct{ label, value string }{
+		{"Total Sales (" + currency + ")", fmt.Sprintf("%.2f", curr.sales)},
+		{"Orders", fmt.Sprintf("%d", int(curr.orders))},
+		{"Units Sold", fmt.Sprintf("%d", int(curr.units))},
+		{"Ad Spend (" + currency + ")", fmt.Sprintf("%.2f", curr.adSpend)},
+		{"ACoS", fmt.Sprintf("%.1f%%", curr.acos)},
+		{"Platform Fees (" + currency + ")", fmt.Sprintf("%.2f", math.Abs(curr.fees))},
+		{"COGS (" + currency + ")", fmt.Sprintf("%.2f", curr.cogs)},
+		{"Net Profit (" + currency + ")", fmt.Sprintf("%.2f", curr.netProfit)},
+		{"Profit Margin", fmt.Sprintf("%.1f%%", curr.profitMargin)},
+		{"Returns (qty)", fmt.Sprintf("%d", curr.returnQty)},
+	}
+
+	drawKPITable(pdf, kpis, currency, curr.netProfit)
+
+	pdf.Ln(6)
+
+	// ── Section 2: 本期 vs 上期环比对比 ──
+	drawSectionTitle(pdf, "2. Period-over-Period Comparison")
+
+	periodLabel := "Last Week"
+	if rType == ReportMonthly { periodLabel = "Last Month" }
+
+	drawComparisonTable(pdf, currency, periodLabel, curr, prev)
+
+	pdf.Ln(6)
+
+	// ── Section 3: 销售趋势迷你折线图 ──
+	drawSectionTitle(pdf, "3. Daily Sales Trend")
+
+	if len(dailyPoints) > 1 {
+		drawSalesTrendChart(pdf, dailyPoints, currency)
+	} else {
+		pdf.SetFont("Helvetica", "I", 9)
+		pdf.SetTextColor(160, 160, 160)
+		pdf.CellFormat(180, 6, "  No daily sales data available for this period.", "", 1, "L", false, 0, "")
+	}
+
+	pdf.Ln(6)
+
+	// ── Section 4: 利润结构分析 ──
+	drawSectionTitle(pdf, "4. Profit Breakdown")
+
+	drawProfitBreakdown(pdf, curr)
+
+	pdf.Ln(6)
+
+	// ── 判断是否需要换页（剩余空间不足 100mm 则换页）──
+	if pdf.GetY() > 200 {
+		pdf.AddPage()
+	}
+
+	// ── Section 5: Top 5 ASIN 利润排行 ──
+	drawSectionTitle(pdf, "5. Top 5 ASINs by Profit")
+
+	if len(top5) > 0 {
+		drawAsinRankTable(pdf, top5, currency)
+	} else {
+		pdf.SetFont("Helvetica", "I", 9)
+		pdf.SetTextColor(160, 160, 160)
+		pdf.CellFormat(180, 6, "  No ASIN profit data available (COGS not configured or no sales).", "", 1, "L", false, 0, "")
+	}
+
+	pdf.Ln(6)
+
+	// ── Section 6: 广告 ROI 摘要 ──
+	drawSectionTitle(pdf, "6. Advertising ROI Summary")
+
+	drawAdROISummary(pdf, currency, curr.adSpend, adSales, adImpressions, adClicks, adOrders, adCTR, adCPC, curr.acos, adROAS)
+
+	pdf.Ln(8)
+
+	// ── 页脚 ──
+	drawFooter(pdf)
+
+	// 写入文件
+	if err := pdf.OutputFileAndClose(outPath); err != nil {
+		slog.Error("PDF: 文件写入失败", "path", outPath, "error", err)
+		return ReportResult{Success: false, Message: fmt.Sprintf("PDF write failed: %v", err)}
+	}
+
+	var sizeStr string
+	if stat, err := os.Stat(outPath); err == nil {
+		sizeStr = fmt.Sprintf("%.1f KB", float64(stat.Size())/1024)
+	}
+
+	slog.Info("PDF 报告生成成功", "path", outPath, "size", sizeStr)
+	return ReportResult{
+		Success:  true,
+		Path:     outPath,
+		Message:  fmt.Sprintf("Report saved: %s", fileName),
+		FileSize: sizeStr,
+	}
+}
+
+// ══════════════════════════════════════════════════════
+// 数据查询辅助
+// ══════════════════════════════════════════════════════
+
+// periodKPI 期间 KPI 数据
+type periodKPI struct {
+	sales        float64
+	units        float64
+	orders       float64
+	adSpend      float64
+	fees         float64
+	cogs         float64
+	netProfit    float64
+	profitMargin float64
+	acos         float64
+	returnQty    int
+}
+
+// queryPeriodKPI 查询指定期间的 KPI 数据
+func queryPeriodKPI(db *database.DB, accountID int64, marketplaceID, dateStart, dateEnd string) periodKPI {
+	var p periodKPI
+
+	// 使用只读连接，避免 PDF 生成期间阻塞写操作
+	db.ReadQueryRow(`SELECT COALESCE(SUM(ordered_product_sales),0), COALESCE(SUM(units_ordered),0)
+		FROM sales_traffic_daily WHERE account_id=? AND marketplace_id=? AND date>=? AND date<=?`,
+		accountID, marketplaceID, dateStart, dateEnd).Scan(&p.sales, &p.units)
+
+	db.ReadQueryRow(`SELECT COALESCE(SUM(apd.cost),0)
+		FROM ad_performance_daily apd
+		JOIN ad_campaigns ac ON apd.campaign_id=ac.campaign_id AND apd.account_id=ac.account_id
+		WHERE apd.account_id=? AND ac.marketplace_id=? AND apd.date>=? AND apd.date<=?`,
+		accountID, marketplaceID, dateStart, dateEnd).Scan(&p.adSpend)
+
+	db.ReadQueryRow(`SELECT COALESCE(SUM(marketplace_fee + fba_fee),0) FROM financial_events
+		WHERE account_id=? AND marketplace_id=? AND posted_date>=? AND posted_date<=?`,
+		accountID, marketplaceID, dateStart+" 00:00:00", dateEnd+" 23:59:59").Scan(&p.fees)
+
+	db.ReadQueryRow(`SELECT COALESCE(SUM(pc.unit_cost * oi.quantity_ordered), 0)
+		FROM order_items oi
+		JOIN orders o ON oi.amazon_order_id=o.amazon_order_id
+		JOIN product_costs pc ON oi.seller_sku=pc.seller_sku AND pc.account_id=o.account_id
+		WHERE o.account_id=? AND o.marketplace_id=?
+		  AND o.purchase_date>=? AND o.purchase_date<=?
+		  AND o.order_status NOT IN ('Canceled','Declined')`,
+		accountID, marketplaceID, dateStart+" 00:00:00", dateEnd+" 23:59:59").Scan(&p.cogs)
+
+	db.ReadQueryRow(`SELECT COUNT(DISTINCT o.amazon_order_id) FROM orders o
+		WHERE o.account_id=? AND o.marketplace_id=?
+		  AND o.purchase_date>=? AND o.purchase_date<=?
+		  AND o.order_status NOT IN ('Canceled','Declined')`,
+		accountID, marketplaceID, dateStart+" 00:00:00", dateEnd+" 23:59:59").Scan(&p.orders)
+
+	db.ReadQueryRow(`SELECT COALESCE(SUM(quantity),0) FROM fba_returns
+		WHERE account_id=? AND marketplace_id=? AND return_date>=? AND return_date<=?`,
+		accountID, marketplaceID, dateStart, dateEnd).Scan(&p.returnQty)
+
+	p.netProfit = p.sales - p.adSpend - math.Abs(p.fees) - p.cogs
+	if p.sales > 0 {
+		p.profitMargin = p.netProfit / p.sales * 100
+		p.acos = p.adSpend / p.sales * 100
+	}
+
+	return p
+}
+
+// queryDailySales 查询每日销售额（用于趋势图）
+func queryDailySales(db *database.DB, accountID int64, marketplaceID, dateStart, dateEnd string) []pdfDailyPoint {
+	// 使用只读连接，避免 PDF 生成期间阻塞写操作
+	rows, err := db.ReadQuery(`
+		SELECT date, COALESCE(ordered_product_sales, 0)
+		FROM sales_traffic_daily
+		WHERE account_id=? AND marketplace_id=? AND date>=? AND date<=?
+		ORDER BY date ASC
+	`, accountID, marketplaceID, dateStart, dateEnd)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var points []pdfDailyPoint
+	for rows.Next() {
+		var p pdfDailyPoint
+		if err := rows.Scan(&p.Date, &p.Sales); err != nil {
+			continue
+		}
+		points = append(points, p)
+	}
+	return points
+}
+
+// queryTopAsins 查询 Top N ASIN 利润排行（按毛利降序）
+func queryTopAsins(db *database.DB, accountID int64, marketplaceID, dateStart, dateEnd string, topN int) []pdfAsinRank {
+	// 使用只读连接，避免 PDF 生成期间阻塞写操作
+	rows, err := db.ReadQuery(`
+		SELECT
+			t.asin,
+			COALESCE(p.title, t.asin) AS title,
+			COALESCE(SUM(t.ordered_product_sales), 0) AS total_sales,
+			COALESCE(SUM(t.units_ordered), 0) AS units_sold,
+			COALESCE(pc.unit_cost, 0) AS unit_cost
+		FROM sales_traffic_by_asin t
+		LEFT JOIN products p ON t.asin = p.asin AND p.account_id = t.account_id AND p.marketplace_id = t.marketplace_id
+		LEFT JOIN product_costs pc
+			ON pc.account_id = t.account_id
+			AND pc.seller_sku = (
+				SELECT seller_sku FROM products
+				WHERE asin = t.asin AND account_id = t.account_id AND marketplace_id = t.marketplace_id
+				LIMIT 1
+			)
+		WHERE t.account_id = ? AND t.marketplace_id = ?
+		  AND t.date >= ? AND t.date <= ?
+		GROUP BY t.asin
+		HAVING total_sales > 0
+		ORDER BY total_sales DESC
+		LIMIT 20
+	`, accountID, marketplaceID, dateStart, dateEnd)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var items []pdfAsinRank
+	for rows.Next() {
+		var asin, titleStr string
+		var sales float64
+		var units int
+		var unitCost float64
+		if err := rows.Scan(&asin, &titleStr, &sales, &units, &unitCost); err != nil {
+			continue
+		}
+		cogs := unitCost * float64(units)
+		profit := sales - cogs
+		margin := 0.0
+		if sales > 0 { margin = profit / sales * 100 }
+		// 截断标题以适配 PDF 表格宽度（按 rune 截断，防止截断多字节字符）
+		titleRunes := []rune(titleStr)
+		if len(titleRunes) > 35 {
+			titleStr = string(titleRunes[:35]) + "..."
+		}
+		items = append(items, pdfAsinRank{
+			ASIN: asin, Title: titleStr,
+			Sales: sales, Profit: profit, Margin: margin, Units: units,
+		})
+	}
+
+	// 按利润降序
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].Profit > items[j].Profit
+	})
+
+	if len(items) > topN {
+		items = items[:topN]
+	}
+	return items
+}
+
+// ══════════════════════════════════════════════════════
+// PDF 绘制辅助函数
+// ══════════════════════════════════════════════════════
+
+// drawDivider 绘制金色分隔线
+func drawDivider(pdf *gofpdf.Fpdf) {
+	pdf.SetDrawColor(201, 168, 76) // #c9a84c
+	pdf.SetLineWidth(0.8)
+	pdf.Line(15, pdf.GetY(), 195, pdf.GetY())
+	pdf.Ln(6)
+}
+
+// drawSectionTitle 绘制段落标题（带金色装饰色块）
+func drawSectionTitle(pdf *gofpdf.Fpdf, text string) {
+	pdf.SetFont("Helvetica", "B", 11)
+	pdf.SetTextColor(26, 39, 68)
+	// 小色块装饰
+	x, y := pdf.GetX(), pdf.GetY()
+	pdf.SetFillColor(201, 168, 76) // 金色
+	pdf.Rect(x, y+1, 3, 6, "F")
+	pdf.SetX(x + 6)
+	pdf.CellFormat(174, 8, text, "", 1, "L", false, 0, "")
+	pdf.Ln(2)
+}
+
+// drawKPITable 绘制 KPI 表格
+func drawKPITable(pdf *gofpdf.Fpdf, kpis []struct{ label, value string }, currency string, netProfit float64) {
+	// 表头
+	pdf.SetFont("Helvetica", "B", 9)
+	pdf.SetFillColor(26, 39, 68)
+	pdf.SetTextColor(255, 255, 255)
+	pdf.CellFormat(100, 7, "  Metric", "1", 0, "L", true, 0, "")
+	pdf.CellFormat(80, 7, "Value", "1", 1, "R", true, 0, "")
+
+	// 表格行
+	pdf.SetFont("Helvetica", "", 9)
+	for i, kpi := range kpis {
+		if i%2 == 0 {
+			pdf.SetFillColor(245, 247, 250)
+		} else {
+			pdf.SetFillColor(255, 255, 255)
+		}
+		pdf.SetTextColor(50, 50, 50)
+		pdf.CellFormat(100, 6, "  "+kpi.label, "1", 0, "L", true, 0, "")
+
+		// 净利润/利润率特殊着色
+		netProfitLabel := "Net Profit (" + currency + ")"
+		if kpi.label == netProfitLabel || kpi.label == "Profit Margin" {
+			if netProfit >= 0 {
+				pdf.SetTextColor(16, 185, 129) // 绿色
+			} else {
+				pdf.SetTextColor(239, 68, 68) // 红色
+			}
+		}
+		pdf.CellFormat(80, 6, kpi.value+"  ", "1", 1, "R", true, 0, "")
+		pdf.SetTextColor(50, 50, 50)
+	}
+}
+
+// drawComparisonTable 绘制本期 vs 上期环比对比表
+func drawComparisonTable(pdf *gofpdf.Fpdf, currency, prevLabel string, curr, prev periodKPI) {
+	type compRow struct {
+		label      string
+		currVal    string
+		prevVal    string
+		trend      float64 // 百分比
+		trendStr   string
+	}
+
+	calcTrend := func(c, p float64) (float64, string) {
+		if p == 0 {
+			if c > 0 { return 100, "+100.0%" }
+			return 0, "—"
+		}
+		pct := (c - p) / math.Abs(p) * 100
+		sign := "+"
+		if pct < 0 { sign = "" }
+		return pct, fmt.Sprintf("%s%.1f%%", sign, pct)
+	}
+
+	rows := make([]compRow, 0, 6)
+	items := []struct{ label string; curr, prev float64; format string }{
+		{"Sales (" + currency + ")", curr.sales, prev.sales, "%.2f"},
+		{"Orders", curr.orders, prev.orders, "%.0f"},
+		{"Units", curr.units, prev.units, "%.0f"},
+		{"Ad Spend (" + currency + ")", curr.adSpend, prev.adSpend, "%.2f"},
+		{"Net Profit (" + currency + ")", curr.netProfit, prev.netProfit, "%.2f"},
+		{"Profit Margin", curr.profitMargin, prev.profitMargin, "%.1f%%"},
+	}
+
+	for _, it := range items {
+		trend, trendStr := calcTrend(it.curr, it.prev)
+		cStr := fmt.Sprintf(it.format, it.curr)
+		pStr := fmt.Sprintf(it.format, it.prev)
+		rows = append(rows, compRow{label: it.label, currVal: cStr, prevVal: pStr, trend: trend, trendStr: trendStr})
+	}
+
+	// 表头
+	pdf.SetFont("Helvetica", "B", 9)
+	pdf.SetFillColor(26, 39, 68)
+	pdf.SetTextColor(255, 255, 255)
+	pdf.CellFormat(55, 7, "  Metric", "1", 0, "L", true, 0, "")
+	pdf.CellFormat(40, 7, "Current", "1", 0, "R", true, 0, "")
+	pdf.CellFormat(40, 7, prevLabel, "1", 0, "R", true, 0, "")
+	pdf.CellFormat(45, 7, "Change", "1", 1, "R", true, 0, "")
+
+	pdf.SetFont("Helvetica", "", 9)
+	// 成本类指标列表：增长为坏（红色），下降为好（绿色）
+	costMetrics := map[string]bool{"Ad Spend (" + currency + ")": true}
+	for i, r := range rows {
+		if i%2 == 0 {
+			pdf.SetFillColor(245, 247, 250)
+		} else {
+			pdf.SetFillColor(255, 255, 255)
+		}
+		pdf.SetTextColor(50, 50, 50)
+		pdf.CellFormat(55, 6, "  "+r.label, "1", 0, "L", true, 0, "")
+		pdf.CellFormat(40, 6, r.currVal+"  ", "1", 0, "R", true, 0, "")
+		pdf.CellFormat(40, 6, r.prevVal+"  ", "1", 0, "R", true, 0, "")
+
+		// 趋势着色：成本类指标方向反转（增长=红色/坏，下降=绿色/好）
+		isCost := costMetrics[r.label]
+		if r.trend > 0 {
+			if isCost {
+				pdf.SetTextColor(239, 68, 68)  // 成本增长 → 红色
+			} else {
+				pdf.SetTextColor(16, 185, 129) // 收入/利润增长 → 绿色
+			}
+		} else if r.trend < 0 {
+			if isCost {
+				pdf.SetTextColor(16, 185, 129) // 成本下降 → 绿色
+			} else {
+				pdf.SetTextColor(239, 68, 68)  // 收入/利润下降 → 红色
+			}
+		} else {
+			pdf.SetTextColor(120, 120, 120)
+		}
+		pdf.CellFormat(45, 6, r.trendStr+"  ", "1", 1, "R", true, 0, "")
+	}
+}
+
+// drawSalesTrendChart 使用 gofpdf 原生矢量绘制销售趋势迷你折线图
+func drawSalesTrendChart(pdf *gofpdf.Fpdf, points []pdfDailyPoint, currency string) {
+	if len(points) < 2 {
+		return
+	}
+
+	// 图表区域
+	chartX := 20.0
+	chartY := pdf.GetY() + 2
+	chartW := 165.0
+	chartH := 40.0
+
+	// 找最大最小值
+	maxSales := 0.0
+	minSales := math.MaxFloat64
+	for _, p := range points {
+		if p.Sales > maxSales { maxSales = p.Sales }
+		if p.Sales < minSales { minSales = p.Sales }
+	}
+	// 防止 maxSales == minSales 导致除零
+	if maxSales == minSales {
+		maxSales = minSales + 1
+	}
+
+	// 背景
+	pdf.SetFillColor(250, 251, 253)
+	pdf.Rect(chartX, chartY, chartW, chartH, "F")
+
+	// 绘制水平网格线（3条虚线）
+	pdf.SetDrawColor(220, 225, 235)
+	pdf.SetLineWidth(0.15)
+	for i := 1; i <= 3; i++ {
+		y := chartY + chartH*float64(i)/4
+		// 虚线模拟：短线段
+		for x := chartX; x < chartX+chartW; x += 4 {
+			endX := math.Min(x+2, chartX+chartW)
+			pdf.Line(x, y, endX, y)
+		}
+	}
+
+	// 绘制渐变填充区域（折线下方浅色区域）
+	pdf.SetFillColor(99, 102, 241) // Indigo
+	pdf.SetAlpha(0.1, "Normal")
+	// 构建多边形点
+	polyPoints := make([]gofpdf.PointType, 0, len(points)+2)
+	for i, p := range points {
+		px := chartX + float64(i)/float64(len(points)-1)*chartW
+		py := chartY + chartH - (p.Sales-minSales)/(maxSales-minSales)*chartH
+		polyPoints = append(polyPoints, gofpdf.PointType{X: px, Y: py})
+	}
+	// 闭合到底部
+	polyPoints = append(polyPoints, gofpdf.PointType{X: chartX + chartW, Y: chartY + chartH})
+	polyPoints = append(polyPoints, gofpdf.PointType{X: chartX, Y: chartY + chartH})
+	pdf.Polygon(polyPoints, "F")
+	pdf.SetAlpha(1.0, "Normal")
+
+	// 绘制折线
+	pdf.SetDrawColor(99, 102, 241) // Indigo
+	pdf.SetLineWidth(0.6)
+	for i := 1; i < len(points); i++ {
+		x1 := chartX + float64(i-1)/float64(len(points)-1)*chartW
+		y1 := chartY + chartH - (points[i-1].Sales-minSales)/(maxSales-minSales)*chartH
+		x2 := chartX + float64(i)/float64(len(points)-1)*chartW
+		y2 := chartY + chartH - (points[i].Sales-minSales)/(maxSales-minSales)*chartH
+		pdf.Line(x1, y1, x2, y2)
+	}
+
+	// 数据点圆点（首、末、最高点）
+	maxIdx := 0
+	for i, p := range points {
+		if p.Sales > points[maxIdx].Sales {
+			maxIdx = i
+		}
+	}
+	highlightPoints := []int{0, maxIdx, len(points) - 1}
+	// 去重
+	seen := map[int]bool{}
+	for _, idx := range highlightPoints {
+		if seen[idx] { continue }
+		seen[idx] = true
+		px := chartX + float64(idx)/float64(len(points)-1)*chartW
+		py := chartY + chartH - (points[idx].Sales-minSales)/(maxSales-minSales)*chartH
+		pdf.SetFillColor(99, 102, 241)
+		pdf.Circle(px, py, 1.2, "F")
+		// 数值标签（最高点上方）
+		if idx == maxIdx {
+			pdf.SetFont("Helvetica", "B", 7)
+			pdf.SetTextColor(99, 102, 241)
+			label := fmt.Sprintf("%.0f", points[idx].Sales)
+			pdf.SetXY(px-10, py-5)
+			pdf.CellFormat(20, 4, label, "", 0, "C", false, 0, "")
+		}
+	}
+
+	// X 轴标签（首日和末日）
+	pdf.SetFont("Helvetica", "", 7)
+	pdf.SetTextColor(140, 140, 140)
+	// 首日标签
+	firstLabel := points[0].Date
+	if len(firstLabel) > 5 { firstLabel = firstLabel[5:] } // "MM-DD"
+	pdf.SetXY(chartX-3, chartY+chartH+1)
+	pdf.CellFormat(20, 4, firstLabel, "", 0, "L", false, 0, "")
+	// 末日标签
+	lastLabel := points[len(points)-1].Date
+	if len(lastLabel) > 5 { lastLabel = lastLabel[5:] }
+	pdf.SetXY(chartX+chartW-17, chartY+chartH+1)
+	pdf.CellFormat(20, 4, lastLabel, "", 0, "R", false, 0, "")
+
+	// Y 轴标签（最大和最小值）
+	pdf.SetXY(chartX+chartW+1, chartY-1)
+	pdf.CellFormat(20, 4, fmt.Sprintf("%.0f", maxSales), "", 0, "L", false, 0, "")
+	pdf.SetXY(chartX+chartW+1, chartY+chartH-3)
+	pdf.CellFormat(20, 4, fmt.Sprintf("%.0f", minSales), "", 0, "L", false, 0, "")
+
+	// 移动光标到图表下方
+	pdf.SetY(chartY + chartH + 6)
+}
+
+// drawProfitBreakdown 利润结构百分比条形图
+func drawProfitBreakdown(pdf *gofpdf.Fpdf, curr periodKPI) {
+	if curr.sales <= 0 {
+		pdf.SetFont("Helvetica", "I", 9)
+		pdf.SetTextColor(160, 160, 160)
+		pdf.CellFormat(180, 6, "  No sales data for profit breakdown.", "", 1, "L", false, 0, "")
+		return
+	}
+
+	bars := []struct {
+		label   string
+		pct     float64
+		r, g, b int
+	}{
+		{"Ad Spend", curr.adSpend / curr.sales * 100, 239, 68, 68},
+		{"Platform Fees", math.Abs(curr.fees) / curr.sales * 100, 249, 158, 11},
+		{"COGS", curr.cogs / curr.sales * 100, 59, 130, 246},
+		{"Net Profit", curr.profitMargin, 16, 185, 129},
+	}
+	for _, b := range bars {
+		pdf.SetFont("Helvetica", "", 9)
+		pdf.SetTextColor(80, 80, 80)
+		pdf.CellFormat(35, 6, "  "+b.label, "", 0, "L", false, 0, "")
+		barWidth := math.Max(0, math.Min(b.pct, 100)) * 1.2
+		pdf.SetFillColor(b.r, b.g, b.b)
+		pdf.CellFormat(barWidth, 6, "", "", 0, "", true, 0, "")
+		pdf.SetFont("Helvetica", "", 8)
+		pdf.CellFormat(30, 6, fmt.Sprintf(" %.1f%%", b.pct), "", 1, "L", false, 0, "")
+	}
+}
+
+// drawAsinRankTable 绘制 ASIN 利润排行表
+func drawAsinRankTable(pdf *gofpdf.Fpdf, items []pdfAsinRank, currency string) {
+	// 表头
+	pdf.SetFont("Helvetica", "B", 8)
+	pdf.SetFillColor(26, 39, 68)
+	pdf.SetTextColor(255, 255, 255)
+	pdf.CellFormat(8, 7, " #", "1", 0, "C", true, 0, "")
+	pdf.CellFormat(25, 7, "ASIN", "1", 0, "C", true, 0, "")
+	pdf.CellFormat(62, 7, "Title", "1", 0, "C", true, 0, "")
+	pdf.CellFormat(25, 7, "Sales", "1", 0, "C", true, 0, "")
+	pdf.CellFormat(25, 7, "Profit", "1", 0, "C", true, 0, "")
+	pdf.CellFormat(20, 7, "Margin", "1", 0, "C", true, 0, "")
+	pdf.CellFormat(15, 7, "Units", "1", 1, "C", true, 0, "")
+
+	pdf.SetFont("Helvetica", "", 8)
+	for i, item := range items {
+		if i%2 == 0 {
+			pdf.SetFillColor(245, 247, 250)
+		} else {
+			pdf.SetFillColor(255, 255, 255)
+		}
+		pdf.SetTextColor(50, 50, 50)
+
+		pdf.CellFormat(8, 6, fmt.Sprintf(" %d", i+1), "1", 0, "C", true, 0, "")
+		pdf.CellFormat(25, 6, item.ASIN, "1", 0, "L", true, 0, "")
+		// 标题已在 queryTopAsins 中截断，直接使用
+		pdf.CellFormat(62, 6, " "+item.Title, "1", 0, "L", true, 0, "")
+		pdf.CellFormat(25, 6, fmt.Sprintf("%.0f ", item.Sales), "1", 0, "R", true, 0, "")
+
+		// 利润着色
+		if item.Profit >= 0 {
+			pdf.SetTextColor(16, 185, 129)
+		} else {
+			pdf.SetTextColor(239, 68, 68)
+		}
+		pdf.CellFormat(25, 6, fmt.Sprintf("%.0f ", item.Profit), "1", 0, "R", true, 0, "")
+		pdf.CellFormat(20, 6, fmt.Sprintf("%.1f%% ", item.Margin), "1", 0, "R", true, 0, "")
+		pdf.SetTextColor(50, 50, 50)
+		pdf.CellFormat(15, 6, fmt.Sprintf("%d ", item.Units), "1", 1, "R", true, 0, "")
+	}
+
+	// 数据来源说明
+	pdf.SetFont("Helvetica", "I", 7)
+	pdf.SetTextColor(160, 160, 160)
+	pdf.CellFormat(180, 4, "  * Profit = Sales - COGS (excludes platform fees & ad spend). Data Kiosk T+2 latency.", "", 1, "L", false, 0, "")
+}
+
+// drawAdROISummary 绘制广告 ROI 摘要
+func drawAdROISummary(pdf *gofpdf.Fpdf, currency string, adSpend, adSales float64, impressions, clicks, orders int, ctr, cpc, acos, roas float64) {
+	adKpis := []struct{ label, value string }{
+		{"Impressions", fmt.Sprintf("%d", impressions)},
+		{"Clicks", fmt.Sprintf("%d", clicks)},
+		{"CTR", fmt.Sprintf("%.2f%%", ctr)},
+		{"CPC (" + currency + ")", fmt.Sprintf("%.2f", cpc)},
+		{"Ad Spend (" + currency + ")", fmt.Sprintf("%.2f", adSpend)},
+		{"Attributed Sales (" + currency + ")", fmt.Sprintf("%.2f", adSales)},
+		{"Attributed Orders", fmt.Sprintf("%d", orders)},
+		{"ACoS", fmt.Sprintf("%.1f%%", acos)},
+		{"ROAS", fmt.Sprintf("%.2fx", roas)},
+	}
+
+	// 使用双列布局节省空间
+	pdf.SetFont("Helvetica", "", 9)
+	cols := 2
+	rowsPerCol := (len(adKpis) + cols - 1) / cols
+
+	for r := 0; r < rowsPerCol; r++ {
+		for c := 0; c < cols; c++ {
+			idx := r + c*rowsPerCol
+			if idx >= len(adKpis) {
+				// 补空白单元格（带边框保持视觉一致性）
+				pdf.SetFillColor(255, 255, 255)
+				pdf.CellFormat(50, 6, "", "1", 0, "", true, 0, "")
+				pdf.CellFormat(40, 6, "", "1", 0, "", true, 0, "")
+				continue
+			}
+			kpi := adKpis[idx]
+			if (r+c)%2 == 0 {
+				pdf.SetFillColor(245, 247, 250)
+			} else {
+				pdf.SetFillColor(255, 255, 255)
+			}
+			pdf.SetTextColor(80, 80, 80)
+			pdf.CellFormat(50, 6, "  "+kpi.label, "1", 0, "L", true, 0, "")
+
+			// ACoS/ROAS 特殊着色
+			if kpi.label == "ACoS" && acos > 30 {
+				pdf.SetTextColor(239, 68, 68)
+			} else if kpi.label == "ROAS" && roas >= 3 {
+				pdf.SetTextColor(16, 185, 129)
+			} else {
+				pdf.SetTextColor(50, 50, 50)
+			}
+			pdf.CellFormat(40, 6, kpi.value+" ", "1", 0, "R", true, 0, "")
+			pdf.SetTextColor(50, 50, 50)
+		}
+		pdf.Ln(-1)
+	}
+
+	// 广告数据延迟说明
+	pdf.SetFont("Helvetica", "I", 7)
+	pdf.SetTextColor(160, 160, 160)
+	pdf.CellFormat(180, 4, "  * Advertising data has ~T+3 latency. Attribution window: 7-day.", "", 1, "L", false, 0, "")
+}
+
+// drawFooter 页脚
+func drawFooter(pdf *gofpdf.Fpdf) {
+	pdf.SetDrawColor(220, 220, 220)
+	pdf.Line(15, pdf.GetY(), 195, pdf.GetY())
+	pdf.Ln(4)
+	pdf.SetFont("Helvetica", "I", 8)
+	pdf.SetTextColor(160, 160, 160)
+	pdf.CellFormat(180, 5, "Confidential · Voyage Analytics Platform · Data from Amazon SP-API & Advertising API", "", 1, "C", false, 0, "")
+}
+
+
